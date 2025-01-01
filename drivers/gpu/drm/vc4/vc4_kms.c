@@ -40,6 +40,9 @@ static struct vc4_ctm_state *to_vc4_ctm_state(struct drm_private_state *priv)
 struct vc4_hvs_state {
 	struct drm_private_state base;
 	unsigned int unassigned_channels;
+	unsigned int num_outputs;
+	unsigned long fifo_load;
+	unsigned long core_clock_rate;
 };
 
 static struct vc4_hvs_state *
@@ -186,6 +189,19 @@ vc4_ctm_commit(struct vc4_dev *vc4, struct drm_atomic_state *state)
 }
 
 static struct vc4_hvs_state *
+vc4_hvs_get_new_global_state(struct drm_atomic_state *state)
+{
+	struct vc4_dev *vc4 = to_vc4_dev(state->dev);
+	struct drm_private_state *priv_state;
+
+	priv_state = drm_atomic_get_new_private_obj_state(state, &vc4->hvs_channels);
+	if (IS_ERR(priv_state))
+		return ERR_CAST(priv_state);
+
+	return to_vc4_hvs_state(priv_state);
+}
+
+static struct vc4_hvs_state *
 vc4_hvs_get_global_state(struct drm_atomic_state *state)
 {
 	struct vc4_dev *vc4 = to_vc4_dev(state->dev);
@@ -206,6 +222,7 @@ static void vc4_hvs_pv_muxing_commit(struct vc4_dev *vc4,
 	unsigned int i;
 
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		struct vc4_crtc *vc4_crtc = to_vc4_crtc(crtc);
 		struct vc4_crtc_state *vc4_state = to_vc4_crtc_state(crtc_state);
 		u32 dispctrl;
 		u32 dsp3_mux;
@@ -226,7 +243,7 @@ static void vc4_hvs_pv_muxing_commit(struct vc4_dev *vc4,
 		 * TXP IP, and we need to disable the FIFO2 -> pixelvalve1
 		 * route.
 		 */
-		if (vc4_state->feed_txp)
+		if (vc4_crtc->feeds_txp)
 			dsp3_mux = VC4_SET_FIELD(3, SCALER_DISPCTRL_DSP3_MUX);
 		else
 			dsp3_mux = VC4_SET_FIELD(2, SCALER_DISPCTRL_DSP3_MUX);
@@ -305,106 +322,6 @@ static void vc5_hvs_pv_muxing_commit(struct vc4_dev *vc4,
 	}
 }
 
-#define HVS_BUS_WIDTH	4
-
-/*
- * On the BCM2711, the core clock needs to be raised depending on the
- * rate of pixels being fetched from memory by the HVS and then the
- * pixels being output to the PixelValves.
- *
- * Thus, we need to consider the mode on each CRTC to compute the output
- * pixel rate, and all the planes attached to those CRTCs to compute the
- * input rate, and take the highest of the two.
- */
-static unsigned long vc5_hvs_compute_core_rate(struct vc4_dev *vc4,
-					       struct drm_atomic_state *state)
-{
-	struct drm_crtc *crtc;
-	unsigned long cob_rate = 0;
-	unsigned long pixel_rate = 0;
-	unsigned num_outputs = 0;
-
-	drm_for_each_crtc(crtc, state->dev) {
-		const struct drm_display_mode *mode;
-		struct drm_crtc_state *crtc_state;
-		struct vc4_encoder *vc4_encoder;
-		struct drm_encoder *encoder;
-		struct drm_plane *plane;
-		unsigned long min_rate;
-		unsigned refresh;
-
-		crtc_state = drm_atomic_get_new_or_current_crtc_state(state, crtc);
-		if (!crtc_state)
-			continue;
-
-		if (!crtc_state->active)
-			continue;
-
-		mode = &crtc_state->adjusted_mode;
-		encoder = vc4_get_crtc_encoder(crtc, state,
-					       drm_atomic_get_connector_state);
-		if (!encoder)
-			continue;
-
-		num_outputs++;
-		vc4_encoder = to_vc4_encoder(encoder);
-
-		/*
-		 * The HVS only generates the active pixels and stores
-		 * completed lines in the COB. However, pixel-valve
-		 * consumes at the HDMI pixel clock rate which can be a
-		 * lot higher than the number of active pixels e.g. 4K
-		 * p60 is 594 MHz but active pixels would be 498 MHz.
-		 * The COB output is one pixel per clock and runs of the
-		 * the core clock and needs to run fast enough to send
-		 * the active pixels minus the buffering in pixel-valve.
-		 *
-		 * For PV2 (HDMI0) there are 512 pixels and for PV4
-		 * (HDMI1) there are 58. This means that for HDMI1 the
-		 * core-clock needs to be the same as the pixel clock
-		 * but for HDMI0 the core-clock can be a bit slower -
-		 * experiments suggest that 90% is about right so long
-		 * as the horizontal blanking period is at least 10% of
-		 * the total horizonal time, this isn't always in the
-		 * case.
-		 */
-		if (vc4_encoder->type == VC4_ENCODER_TYPE_HDMI0) {
-			min_rate = max(mode->clock * mode->hdisplay / mode->htotal + 1000,
-				       mode->clock * 9 / 10) * 1000;
-		} else {
-			min_rate = mode->clock * 1000;
-		}
-		cob_rate = max(cob_rate, min_rate);
-
-		refresh = drm_mode_vrefresh(mode);
-		drm_for_each_plane_mask(plane, state->dev, crtc_state->plane_mask) {
-			struct drm_plane_state *plane_state =
-				drm_atomic_get_plane_state(state, plane);
-			unsigned height, width;
-
-			if (!plane_state->fb)
-				continue;
-
-			height = plane_state->src_h >> 16;
-			width = plane_state->src_w >> 16;
-
-			pixel_rate += height * width * refresh;
-		}
-	}
-
-	/*
-	 * We need to target a memory bus load of 60% if we have a
-	 * single HVS channel enabled, and 40% otherwise.
-	 */
-	if (num_outputs > 1)
-		pixel_rate = pixel_rate / 40;
-	else
-		pixel_rate = pixel_rate / 60;
-	pixel_rate = pixel_rate * 100;
-
-	return max(cob_rate, pixel_rate / HVS_BUS_WIDTH);
-}
-
 static void
 vc4_atomic_complete_commit(struct drm_atomic_state *state)
 {
@@ -412,9 +329,14 @@ vc4_atomic_complete_commit(struct drm_atomic_state *state)
 	struct vc4_dev *vc4 = to_vc4_dev(dev);
 	struct vc4_hvs *hvs = vc4->hvs;
 	struct drm_crtc_state *new_crtc_state;
+	struct vc4_hvs_state *hvs_state;
 	struct drm_crtc *crtc;
 	struct clk_request *core_req;
 	int i;
+
+	hvs_state = vc4_hvs_get_new_global_state(state);
+	if (WARN_ON(!hvs_state))
+		return;
 
 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
 		struct vc4_crtc_state *vc4_crtc_state;
@@ -427,11 +349,17 @@ vc4_atomic_complete_commit(struct drm_atomic_state *state)
 	}
 
 	if (vc4->hvs && vc4->hvs->hvs5) {
+		unsigned long core_rate = max_t(unsigned long,
+						500000000,
+						hvs_state->core_clock_rate);
+
+		drm_dbg(dev, "Raising the core clock at %lu Hz\n", core_rate);
+
 		/*
 		 * Do a temporary request on the core clock during the
 		 * modeset.
 		 */
-		core_req = clk_request_start(hvs->core_clk, 500000000);
+		core_req = clk_request_start(hvs->core_clk, core_rate);
 
 		/*
 		 * And remove the previous one based on the HVS
@@ -470,15 +398,15 @@ vc4_atomic_complete_commit(struct drm_atomic_state *state)
 	drm_atomic_helper_commit_cleanup_done(state);
 
 	if (vc4->hvs && vc4->hvs->hvs5) {
-		unsigned long core_rate = vc5_hvs_compute_core_rate(vc4,
-								    state);
+		drm_dbg(dev, "Running the core clock at %lu Hz\n",
+			hvs_state->core_clock_rate);
 
 		/*
 		 * Request a clock rate based on the current HVS
 		 * requirements.
 		 */
 		hvs->core_req = clk_request_start(hvs->core_clk,
-						  core_rate);
+						  hvs_state->core_clock_rate);
 
 		/* And drop the temporary request */
 		clk_request_done(core_req);
@@ -721,9 +649,6 @@ static int vc4_load_tracker_atomic_check(struct drm_atomic_state *state)
 	struct drm_plane *plane;
 	int i;
 
-	if (!vc4->load_tracker_available)
-		return 0;
-
 	priv_state = drm_atomic_get_private_obj_state(state,
 						      &vc4->load_tracker);
 	if (IS_ERR(priv_state))
@@ -798,18 +723,12 @@ static void vc4_load_tracker_obj_fini(struct drm_device *dev, void *unused)
 {
 	struct vc4_dev *vc4 = to_vc4_dev(dev);
 
-	if (!vc4->load_tracker_available)
-		return;
-
 	drm_atomic_private_obj_fini(&vc4->load_tracker);
 }
 
 static int vc4_load_tracker_obj_init(struct vc4_dev *vc4)
 {
 	struct vc4_load_tracker_state *load_state;
-
-	if (!vc4->load_tracker_available)
-		return 0;
 
 	load_state = kzalloc(sizeof(*load_state), GFP_KERNEL);
 	if (!load_state)
@@ -835,6 +754,9 @@ vc4_hvs_channels_duplicate_state(struct drm_private_obj *obj)
 	__drm_atomic_helper_private_obj_duplicate_state(obj, &state->base);
 
 	state->unassigned_channels = old_state->unassigned_channels;
+	state->fifo_load = old_state->fifo_load;
+	state->num_outputs = old_state->num_outputs;
+	state->core_clock_rate = old_state->core_clock_rate;
 
 	return &state->base;
 }
@@ -925,6 +847,7 @@ static int vc4_pv_muxing_atomic_check(struct drm_device *dev,
 			to_vc4_crtc_state(new_crtc_state);
 		struct vc4_crtc *vc4_crtc = to_vc4_crtc(crtc);
 		unsigned int matching_channels;
+		unsigned int channel;
 
 		if (vc4->firmware_kms)
 			continue;
@@ -968,18 +891,75 @@ static int vc4_pv_muxing_atomic_check(struct drm_device *dev,
 		 * but it works so far.
 		 */
 		matching_channels = hvs_new_state->unassigned_channels & vc4_crtc->data->hvs_available_channels;
-		if (matching_channels) {
-			unsigned int channel = ffs(matching_channels) - 1;
-
-			new_vc4_crtc_state->assigned_channel = channel;
-			hvs_new_state->unassigned_channels &= ~BIT(channel);
-		} else {
+		if (!matching_channels)
 			return -EINVAL;
-		}
+
+		channel = ffs(matching_channels) - 1;
+		new_vc4_crtc_state->assigned_channel = channel;
+		hvs_new_state->unassigned_channels &= ~BIT(channel);
 	}
 
 	return 0;
 }
+
+static int
+vc4_core_clock_atomic_check(struct drm_atomic_state *state)
+{
+	struct vc4_dev *vc4 = to_vc4_dev(state->dev);
+	struct drm_private_state *priv_state;
+	struct vc4_hvs_state *hvs_new_state;
+	struct vc4_load_tracker_state *load_state;
+	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+	struct drm_crtc *crtc;
+	unsigned long pixel_rate;
+	unsigned long cob_rate;
+	unsigned int i;
+
+	priv_state = drm_atomic_get_private_obj_state(state,
+						      &vc4->load_tracker);
+	if (IS_ERR(priv_state))
+		return PTR_ERR(priv_state);
+
+	load_state = to_vc4_load_tracker_state(priv_state);
+
+	hvs_new_state = vc4_hvs_get_global_state(state);
+	if (!hvs_new_state)
+		return -EINVAL;
+
+	for_each_oldnew_crtc_in_state(state, crtc,
+				      old_crtc_state,
+				      new_crtc_state,
+				      i) {
+		if (old_crtc_state->active) {
+			struct vc4_crtc_state *old_vc4_state =
+				to_vc4_crtc_state(old_crtc_state);
+
+			hvs_new_state->num_outputs -= 1;
+			hvs_new_state->fifo_load -= old_vc4_state->hvs_load;
+		}
+
+		if (new_crtc_state->active) {
+			struct vc4_crtc_state *new_vc4_state =
+				to_vc4_crtc_state(new_crtc_state);
+
+			hvs_new_state->num_outputs += 1;
+			hvs_new_state->fifo_load += new_vc4_state->hvs_load;
+		}
+	}
+
+	cob_rate = hvs_new_state->fifo_load;
+	pixel_rate = load_state->hvs_load;
+	if (hvs_new_state->num_outputs > 1) {
+		pixel_rate = (pixel_rate * 40) / 100;
+	} else {
+		pixel_rate = (pixel_rate * 60) / 100;
+	}
+
+	hvs_new_state->core_clock_rate = max(cob_rate, pixel_rate);
+
+	return 0;
+}
+
 
 static int
 vc4_atomic_check(struct drm_device *dev, struct drm_atomic_state *state)
@@ -998,7 +978,11 @@ vc4_atomic_check(struct drm_device *dev, struct drm_atomic_state *state)
 	if (ret)
 		return ret;
 
-	return vc4_load_tracker_atomic_check(state);
+	ret = vc4_load_tracker_atomic_check(state);
+	if (ret)
+		return ret;
+
+	return vc4_core_clock_atomic_check(state);
 }
 
 static const struct drm_mode_config_funcs vc4_mode_funcs = {
@@ -1014,9 +998,12 @@ int vc4_kms_load(struct drm_device *dev)
 					      "brcm,bcm2711-vc5");
 	int ret;
 
+	/*
+	 * The limits enforced by the load tracker aren't relevant for
+	 * the BCM2711, but the load tracker computations are used for
+	 * the core clock rate calculation.
+	 */
 	if (!is_vc5) {
-		vc4->load_tracker_available = true;
-
 		/* Start with the load tracker enabled. Can be
 		 * disabled through the debugfs load_tracker file.
 		 */
